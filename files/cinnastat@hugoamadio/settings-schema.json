@@ -14,7 +14,7 @@
     },
     "width": {
         "type": "spinbutton",
-        "default": 132,
+        "default": 212,
         "min": 60,
         "max": 400,
         "step": 4,

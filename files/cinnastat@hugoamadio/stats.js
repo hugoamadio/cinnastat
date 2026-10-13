@@ -7,15 +7,26 @@ function clamp(v, lo, hi) {
     return v < lo ? lo : v > hi ? hi : v;
 }
 
-// /proc/stat, first line -> { busy, total } in jiffies since boot
-function parseCpu(text) {
-    const line = String(text).split("\n", 1)[0];
-    if (!/^cpu\s/.test(line)) return { busy: 0, total: 0 };
+// one /proc/stat cpu line -> { busy, total } in jiffies since boot
+function cpuTimes(line) {
     // user nice system idle iowait irq softirq steal (guest time is already counted in user)
     const f = line.trim().split(/\s+/).slice(1, 9).map((n) => Number(n) || 0);
     const total = f.reduce((a, b) => a + b, 0);
     const idle = (f[3] || 0) + (f[4] || 0);
     return { busy: total - idle, total };
+}
+
+// /proc/stat -> all cores together
+function parseCpu(text) {
+    const line = String(text).split("\n", 1)[0];
+    return /^cpu\s/.test(line) ? cpuTimes(line) : { busy: 0, total: 0 };
+}
+
+// /proc/stat -> one reading per core (cpu0, cpu1, ...)
+function parseCores(text) {
+    const cores = [];
+    for (const line of String(text).split("\n")) if (/^cpu\d+\s/.test(line)) cores.push(cpuTimes(line));
+    return cores;
 }
 
 // two parseCpu() readings -> busy percentage over the interval between them
@@ -46,34 +57,73 @@ function parseMem(text) {
     };
 }
 
-// /proc/diskstats -> bytes read and written since boot by the disks accept(name) keeps.
-// Sectors here are always 512 bytes, whatever the disk's real sector size.
+// /proc/diskstats -> { name: { read, written, busyMs } } for the disks accept(name) keeps.
+// read/written are bytes (sectors here are always 512 bytes, whatever the disk uses);
+// busyMs is the time the disk had I/O in flight, the same counter iostat's %util uses.
 function parseDisks(text, accept) {
-    let read = 0;
-    let written = 0;
+    const disks = {};
     for (const line of String(text).split("\n")) {
         const f = line.trim().split(/\s+/);
-        if (f.length < 10 || !accept(f[2])) continue;
-        read += (Number(f[5]) || 0) * 512;
-        written += (Number(f[9]) || 0) * 512;
+        if (f.length < 13 || !accept(f[2])) continue;
+        disks[f[2]] = {
+            read: (Number(f[5]) || 0) * 512,
+            written: (Number(f[9]) || 0) * 512,
+            busyMs: Number(f[12]) || 0,
+        };
     }
-    return { read, written };
+    return disks;
 }
 
-// /proc/net/dev -> bytes received and sent since boot by the interfaces accept(name) keeps
+// /proc/net/dev -> { name: { rx, tx } } in bytes, for the interfaces accept(name) keeps
 function parseNet(text, accept) {
-    let rx = 0;
-    let tx = 0;
+    const ifaces = {};
     for (const line of String(text).split("\n")) {
         const i = line.indexOf(":");
         if (i < 0) continue;
         const name = line.slice(0, i).trim();
         const f = line.slice(i + 1).trim().split(/\s+/);
         if (f.length < 9 || !accept(name)) continue;
-        rx += Number(f[0]) || 0;
-        tx += Number(f[8]) || 0;
+        ifaces[name] = { rx: Number(f[0]) || 0, tx: Number(f[8]) || 0 };
     }
-    return { rx, tx };
+    return ifaces;
+}
+
+// sum of one field over parseDisks()/parseNet() entries
+function total(map, field) {
+    let sum = 0;
+    for (const name in map) sum += map[name][field];
+    return sum;
+}
+
+// how busy the busiest disk was over the interval, 0..100
+function diskBusy(prev, cur, seconds) {
+    if (!prev || !cur || !(seconds > 0)) return 0;
+    let max = 0;
+    for (const name in cur) {
+        if (!prev[name]) continue;
+        const ms = cur[name].busyMs - prev[name].busyMs;
+        if (ms > 0) max = Math.max(max, (100 * ms) / (seconds * 1000));
+    }
+    return clamp(max, 0, 100);
+}
+
+// how much of its speed the busiest link used, 0..100, or null when no speed is known.
+// links: { name: { bps, wireless } }. Cable is full duplex, so the busier direction
+// counts; Wi-Fi shares the air, so download and upload add up.
+function netBusy(prev, cur, seconds, links) {
+    if (!prev || !cur || !(seconds > 0)) return null;
+    let max = null;
+    for (const name in links) {
+        const a = prev[name];
+        const b = cur[name];
+        const link = links[name];
+        if (!a || !b || !link || !(link.bps > 0)) continue;
+        const rx = rate(a.rx, b.rx, seconds);
+        const tx = rate(a.tx, b.tx, seconds);
+        const bytes = link.wireless ? rx + tx : Math.max(rx, tx);
+        max = Math.max(max || 0, (100 * bytes * 8) / link.bps);
+    }
+    return max === null ? null : clamp(max, 0, 100);
 }
 
 // /proc/loadavg -> "1.20 0.95 0.80"
@@ -117,6 +167,22 @@ function percent(v) {
     return Math.round(clamp(Number(v) || 0, 0, 100)) + "%";
 }
 
+// memory in use over the total, sized for a cell: "18/31G", "3.2/7.7G", "700/980M"
+function usedOf(used, all) {
+    const big = all >= KIB ** 3;
+    const div = big ? KIB ** 3 : KIB ** 2;
+    const whole = !big || all / div >= 10;
+    const fmt = (v) => (whole ? String(Math.round(v / div)) : (v / div).toFixed(1));
+    return fmt(Math.max(0, Number(used) || 0)) + "/" + fmt(Math.max(0, Number(all) || 0)) + (big ? "G" : "M");
+}
+
+// link speed for the tooltip: "1 Gbit/s", "2.5 Gbit/s", "97.6 Mbit/s", "300 Mbit/s"
+function bitrate(bps) {
+    if (bps >= 1e9) return String(Number((bps / 1e9).toFixed(1))) + " Gbit/s";
+    const m = bps / 1e6;
+    return (m >= 100 ? String(Math.round(m)) : String(Number(m.toFixed(1)))) + " Mbit/s";
+}
+
 // keeps the newest `size` samples
 function push(history, value, size) {
     history.push(value);
@@ -155,15 +221,21 @@ function parseColor(text, fallback) {
 module.exports = {
     clamp,
     parseCpu,
+    parseCores,
     cpuPercent,
     parseMem,
     parseDisks,
     parseNet,
+    total,
+    diskBusy,
+    netBusy,
     parseLoad,
     rate,
     compact,
     human,
     percent,
+    usedOf,
+    bitrate,
     push,
     scaleMax,
     parseColor,

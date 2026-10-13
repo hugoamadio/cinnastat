@@ -1,5 +1,5 @@
 // cinnastat: CPU, memory, disk and network in a tiny 2x2 display on the Cinnamon panel.
-// Everything is read straight from /proc, so there is nothing to install.
+// Everything is read straight from /proc and /sys, so there is nothing to install.
 const Applet = imports.ui.applet;
 const Settings = imports.ui.settings;
 const Util = imports.misc.util;
@@ -11,15 +11,19 @@ const Pango = imports.gi.Pango;
 const PangoCairo = imports.gi.PangoCairo;
 const Stats = require("./stats");
 
-// cells, left to right and top to bottom; rates scale to the busiest sample, with a floor
+// cells, left to right and top to bottom. Each shows a label, an optional detail
+// and a percentage over its history graph. `widest` sizes the detail column.
 const CELLS = [
     { key: "cpu", label: "CPU" },
-    { key: "mem", label: "RAM" },
-    { key: "disk", label: "DISK", floor: 1024 * 1024 },
-    { key: "net", label: "NET", floor: 128 * 1024 },
+    { key: "mem", label: "RAM", widest: "88/88G" },
+    { key: "disk", label: "DISK", widest: "888M" },
+    { key: "net", label: "NET", widest: "888M" },
 ];
-const HISTORY = 400;          // samples kept per cell, more than any cell is wide
+const HISTORY = 600;          // samples kept per cell, more than any cell is wide
 const SPACE_EVERY = 30;       // ticks between disk space checks (tooltip only)
+const LINKS_EVERY = 10;       // ticks between link speed checks
+const NET_FLOOR = 128 * 1024; // graph scale when no link speed is known
+const NM = "org.freedesktop.NetworkManager";
 const DECODER = new TextDecoder();
 
 class CinnastatApplet extends Applet.Applet {
@@ -27,10 +31,12 @@ class CinnastatApplet extends Applet.Applet {
         super(orientation, panelHeight, instanceId);
         this.setAllowedLayout(Applet.AllowedLayout.BOTH);
 
-        this._history = { cpu: [], mem: [], disk: [], net: [] };
-        this._now = { cpu: 0, mem: 0, disk: 0, net: 0 };
+        this._history = { cpu: [], mem: [], disk: [], net: [], netRate: [] };
+        this._now = { cpu: 0, mem: 0, disk: 0, net: null };
         this._prev = null;
+        this._mem = null;
         this._physical = new Map();
+        this._links = new Map();
         this._ticks = 0;
         this._space = null;
         this._timer = 0;
@@ -88,7 +94,7 @@ class CinnastatApplet extends Applet.Applet {
         const thick = this.panel ? this.panel.height : 40;
         const horizontal = this._orientation === St.Side.TOP || this._orientation === St.Side.BOTTOM;
         if (horizontal) {
-            this._area.set_size(Math.round((Number(this.width) || 132) * global.ui_scale), Math.round(thick * 0.85));
+            this._area.set_size(Math.round((Number(this.width) || 212) * global.ui_scale), Math.round(thick * 0.85));
         } else {
             const side = Math.round(thick * 0.85);
             this._area.set_size(side, side);
@@ -127,30 +133,85 @@ class CinnastatApplet extends Applet.Applet {
     }
 
     _sample() {
+        const stat = this._read("/proc/stat");
         const cur = {
             time: GLib.get_monotonic_time() / 1e6,
-            cpu: Stats.parseCpu(this._read("/proc/stat")),
-            disk: Stats.parseDisks(this._read("/proc/diskstats"), (n) => this._isPhysical(`/sys/block/${n}/device`)),
+            cpu: Stats.parseCpu(stat),
+            cores: Stats.parseCores(stat),
+            disks: Stats.parseDisks(this._read("/proc/diskstats"), (n) => this._isPhysical(`/sys/block/${n}/device`)),
             net: Stats.parseNet(this._read("/proc/net/dev"), (n) => this._isPhysical(`/sys/class/net/${n}/device`)),
         };
-        const mem = Stats.parseMem(this._read("/proc/meminfo"));
         const prev = this._prev;
         this._prev = cur;
-        this._mem = mem;
-        if (this._ticks++ % SPACE_EVERY === 0) this._space = this._diskSpace();
+        this._mem = Stats.parseMem(this._read("/proc/meminfo"));
+        if (this._ticks % SPACE_EVERY === 0) this._space = this._diskSpace();
+        if (this._ticks % LINKS_EVERY === 0) this._refreshLinks(Object.keys(cur.net));
+        this._ticks++;
         if (!prev) return;
 
         const dt = cur.time - prev.time;
         const n = this._now;
+        const m = this._mem;
         n.cpu = Stats.cpuPercent(prev.cpu, cur.cpu);
-        n.mem = mem.total ? (100 * mem.used) / mem.total : 0;
-        n.read = Stats.rate(prev.disk.read, cur.disk.read, dt);
-        n.write = Stats.rate(prev.disk.written, cur.disk.written, dt);
-        n.rx = Stats.rate(prev.net.rx, cur.net.rx, dt);
-        n.tx = Stats.rate(prev.net.tx, cur.net.tx, dt);
-        n.disk = n.read + n.write;
-        n.net = n.rx + n.tx;
-        for (const c of CELLS) Stats.push(this._history[c.key], n[c.key], HISTORY);
+        n.busiestCore = 0;
+        cur.cores.forEach((c, i) => { n.busiestCore = Math.max(n.busiestCore, Stats.cpuPercent(prev.cores[i], c)); });
+        n.mem = m.total ? (100 * m.used) / m.total : 0;
+        n.disk = Stats.diskBusy(prev.disks, cur.disks, dt);
+        n.read = Stats.rate(Stats.total(prev.disks, "read"), Stats.total(cur.disks, "read"), dt);
+        n.write = Stats.rate(Stats.total(prev.disks, "written"), Stats.total(cur.disks, "written"), dt);
+        n.net = Stats.netBusy(prev.net, cur.net, dt, Object.fromEntries(this._links));
+        n.rx = Stats.rate(Stats.total(prev.net, "rx"), Stats.total(cur.net, "rx"), dt);
+        n.tx = Stats.rate(Stats.total(prev.net, "tx"), Stats.total(cur.net, "tx"), dt);
+
+        const h = this._history;
+        Stats.push(h.cpu, n.cpu, HISTORY);
+        Stats.push(h.mem, n.mem, HISTORY);
+        Stats.push(h.disk, n.disk, HISTORY);
+        Stats.push(h.net, n.net || 0, HISTORY);
+        Stats.push(h.netRate, n.rx + n.tx, HISTORY);
+    }
+
+    // link speed of every connected interface: cable from sysfs, Wi-Fi from NetworkManager
+    // (the kernel has no speed for Wi-Fi). Interfaces without a speed are left out of NET %.
+    _refreshLinks(names) {
+        for (const name of this._links.keys()) if (!names.includes(name)) this._links.delete(name);
+        for (const name of names) {
+            const dir = `/sys/class/net/${name}`;
+            if (this._read(`${dir}/operstate`).trim() !== "up") {
+                this._links.delete(name);
+            } else if (GLib.file_test(`${dir}/wireless`, GLib.FileTest.IS_DIR)) {
+                this._wifiBitrate(name);
+            } else {
+                const mbps = parseInt(this._read(`${dir}/speed`), 10);
+                if (mbps > 0) this._links.set(name, { bps: mbps * 1e6, wireless: false });
+                else this._links.delete(name);
+            }
+        }
+    }
+
+    _wifiBitrate(name) {
+        const drop = () => this._links.delete(name);
+        const bus = Gio.DBus.system;
+        bus.call(NM, "/org/freedesktop/NetworkManager", NM, "GetDeviceByIpIface",
+            new GLib.Variant("(s)", [name]), new GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 2000, null,
+            (conn, res) => {
+                try {
+                    const path = conn.call_finish(res).deep_unpack()[0];
+                    conn.call(NM, path, "org.freedesktop.DBus.Properties", "Get",
+                        new GLib.Variant("(ss)", [NM + ".Device.Wireless", "Bitrate"]), new GLib.VariantType("(v)"),
+                        Gio.DBusCallFlags.NONE, 2000, null, (conn2, res2) => {
+                            try {
+                                const kbps = conn2.call_finish(res2).get_child_value(0).get_variant().get_uint32();
+                                if (kbps > 0) this._links.set(name, { bps: kbps * 1000, wireless: true });
+                                else drop();
+                            } catch (e) {
+                                drop();
+                            }
+                        });
+                } catch (e) {
+                    drop();
+                }
+            });
     }
 
     _diskSpace() {
@@ -167,17 +228,38 @@ class CinnastatApplet extends Applet.Applet {
         const n = this._now;
         const m = this._mem || { total: 0, used: 0, swapUsed: 0 };
         const rate = (v) => Stats.human(v || 0) + "/s";
+        const cores = this._prev ? this._prev.cores.length : 0;
         const space = this._space && this._space.size > 0
             ? ` · / ${Stats.percent((100 * this._space.used) / this._space.size)} full, ` +
               `${Stats.human(this._space.size - this._space.used)} free`
             : "";
+        const links = [...this._links.entries()]
+            .map(([, l]) => `${l.wireless ? "Wi-Fi" : "cable"} ${Stats.bitrate(l.bps)}`)
+            .join(", ");
         return [
-            `CPU ${Stats.percent(n.cpu)} · load ${Stats.parseLoad(this._read("/proc/loadavg"))}`,
+            `CPU ${Stats.percent(n.cpu)}` + (cores > 1 ? ` (average of ${cores} threads) · busiest thread ${Stats.percent(n.busiestCore)}` : "") +
+                ` · load ${Stats.parseLoad(this._read("/proc/loadavg"))}`,
             `Memory ${Stats.percent(n.mem)} · ${Stats.human(m.used)} of ${Stats.human(m.total)}` +
                 (m.swapUsed > 0 ? ` · swap ${Stats.human(m.swapUsed)}` : ""),
-            `Disk read ${rate(n.read)} · write ${rate(n.write)}${space}`,
-            `Network ↓ ${rate(n.rx)} · ↑ ${rate(n.tx)}`,
+            `Disk ${Stats.percent(n.disk)} busy · read ${rate(n.read)} · write ${rate(n.write)}${space}`,
+            (n.net === null ? "Network" : `Network ${Stats.percent(n.net)} of link`) +
+                ` · ↓ ${rate(n.rx)} · ↑ ${rate(n.tx)}` + (links ? ` · ${links}` : ""),
         ].join("\n");
+    }
+
+    // [detail, value] of a cell; NET shows only its traffic when no link speed is known
+    _texts(key) {
+        const n = this._now;
+        const m = this._mem || { total: 0, used: 0 };
+        switch (key) {
+            case "cpu": return ["", Stats.percent(n.cpu)];
+            case "mem": return [Stats.usedOf(m.used, m.total), Stats.percent(n.mem)];
+            case "disk": return [Stats.compact((n.read || 0) + (n.write || 0)), Stats.percent(n.disk)];
+            default: {
+                const traffic = Stats.compact((n.rx || 0) + (n.tx || 0));
+                return n.net === null ? ["", traffic] : [traffic, Stats.percent(n.net)];
+            }
+        }
     }
 
     _draw(area) {
@@ -190,21 +272,25 @@ class CinnastatApplet extends Applet.Applet {
         const cw = Math.floor((w - gap) / 2);
         const ch = Math.floor((h - gap) / 2);
 
-        const font = node.get_font().copy();
-        font.set_weight(Pango.Weight.BOLD);
-        font.set_absolute_size(Math.max(6, Math.round(ch * 0.62)) * Pango.SCALE);
-        const layout = PangoCairo.create_layout(cr);
-        layout.set_font_description(font);
+        const size = Math.max(6, Math.round(ch * 0.62)) * Pango.SCALE;
+        const bold = node.get_font().copy();
+        bold.set_weight(Pango.Weight.BOLD);
+        bold.set_absolute_size(size);
+        const regular = bold.copy();
+        regular.set_weight(Pango.Weight.NORMAL);
+        const fonts = { bold: PangoCairo.create_layout(cr), regular: PangoCairo.create_layout(cr) };
+        fonts.bold.set_font_description(bold);
+        fonts.regular.set_font_description(regular);
 
         CELLS.forEach((c, i) => {
             const x = (i % 2) * (w - cw);
             const y = Math.floor(i / 2) * (h - ch);
-            this._drawCell(cr, layout, c, x, y, cw, ch, ink);
+            this._drawCell(cr, fonts, c, x, y, cw, ch, ink);
         });
         cr.$dispose();
     }
 
-    _drawCell(cr, layout, cell, x, y, w, h, ink) {
+    _drawCell(cr, fonts, cell, x, y, w, h, ink) {
         const r = Math.min(3 * global.ui_scale, h / 4);
         const color = Stats.parseColor(this[cell.key + "Color"]);
 
@@ -215,8 +301,9 @@ class CinnastatApplet extends Applet.Applet {
         cr.clip();
 
         // history graph: newest sample on the right edge, one sample per pixel
-        const values = this._history[cell.key];
-        const max = cell.floor ? Stats.scaleMax(values.slice(-w), cell.floor) : 100;
+        const rateOnly = cell.key === "net" && this._now.net === null;
+        const values = rateOnly ? this._history.netRate : this._history[cell.key];
+        const max = rateOnly ? Stats.scaleMax(values.slice(-w), NET_FLOOR) : 100;
         const count = Math.min(values.length, w + 1);
         if (count > 1) {
             cr.moveTo(x + w, y + h);
@@ -231,29 +318,42 @@ class CinnastatApplet extends Applet.Applet {
         }
         cr.restore();
 
-        // label on the left, value on the right. The label is dropped when the widest
-        // possible value would not fit next to it, so it does not blink as values change.
+        // label on the left, value on the right, detail just before the value column.
+        // Room is checked against the widest possible texts, so nothing blinks as values
+        // change: the detail goes first when space is short, then the label.
+        const label = cell.label;
+        const [detail, value] = this._texts(cell.key);
         const pad = Math.max(2, Math.round(3 * global.ui_scale));
-        layout.set_text(cell.floor ? "888M" : "100%", -1);
-        const [widest] = layout.get_pixel_size();
-        layout.set_text(cell.label, -1);
-        const [lw] = layout.get_pixel_size();
-        const showLabel = pad + lw + pad + widest + pad <= w;
+        const width = (layout, text) => {
+            layout.set_text(text, -1);
+            return layout.get_pixel_size()[0];
+        };
+        const valueCol = width(fonts.bold, "100%");
+        const lw = width(fonts.bold, label);
+        const dw = cell.widest ? width(fonts.regular, cell.widest) : 0;
+        const showLabel = pad + lw + pad + valueCol + pad <= w;
+        const showDetail = detail && showLabel && pad + lw + 2 * pad + dw + pad + valueCol + pad <= w;
 
-        const value = cell.floor ? Stats.compact(this._now[cell.key]) : Stats.percent(this._now[cell.key]);
-        layout.set_text(value, -1);
-        const [vw, vh] = layout.get_pixel_size();
+        fonts.bold.set_text(value, -1);
+        const [vw, vh] = fonts.bold.get_pixel_size();
         const ty = y + Math.round((h - vh) / 2);
         cr.setSourceRGBA(ink.r, ink.g, ink.b, 0.95);
         cr.moveTo(x + w - pad - vw, ty);
-        PangoCairo.show_layout(cr, layout);
+        PangoCairo.show_layout(cr, fonts.bold);
 
+        if (showDetail) {
+            const tw = width(fonts.regular, detail);
+            cr.setSourceRGBA(ink.r, ink.g, ink.b, 0.8);
+            cr.moveTo(x + w - pad - valueCol - pad - tw, ty);
+            PangoCairo.show_layout(cr, fonts.regular);
+        }
         if (showLabel) {
-            layout.set_text(cell.label, -1);
+            fonts.bold.set_text(label, -1);
             cr.setSourceRGBA(ink.r, ink.g, ink.b, 0.6);
             cr.moveTo(x + pad, ty);
-            PangoCairo.show_layout(cr, layout);
+            PangoCairo.show_layout(cr, fonts.bold);
         }
+        this._fit = Math.max(this._fit || 0, pad + lw + 2 * pad + dw + pad + valueCol + pad);
     }
 }
 
