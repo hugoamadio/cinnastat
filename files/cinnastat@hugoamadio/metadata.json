@@ -1,0 +1,8 @@
+{
+    "uuid": "cinnastat@hugoamadio",
+    "name": "cinnastat",
+    "description": "CPU, memory, disk and network in a tiny 2×2 display on your panel",
+    "version": "0.1.0",
+    "max-instances": -1,
+    "website": "https://github.com/hugoamadio/cinnastat"
+}

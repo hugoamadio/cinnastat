@@ -1,0 +1,58 @@
+{
+    "display-header": {
+        "type": "header",
+        "description": "Display"
+    },
+    "interval": {
+        "type": "spinbutton",
+        "default": 1000,
+        "min": 250,
+        "max": 10000,
+        "step": 250,
+        "units": "ms",
+        "description": "Update every"
+    },
+    "width": {
+        "type": "spinbutton",
+        "default": 132,
+        "min": 60,
+        "max": 400,
+        "step": 4,
+        "units": "px",
+        "description": "Width on a horizontal panel"
+    },
+    "colors-header": {
+        "type": "header",
+        "description": "Colors"
+    },
+    "cpu-color": {
+        "type": "colorchooser",
+        "default": "rgb(78,161,255)",
+        "description": "CPU"
+    },
+    "mem-color": {
+        "type": "colorchooser",
+        "default": "rgb(182,124,255)",
+        "description": "Memory"
+    },
+    "disk-color": {
+        "type": "colorchooser",
+        "default": "rgb(255,179,71)",
+        "description": "Disk"
+    },
+    "net-color": {
+        "type": "colorchooser",
+        "default": "rgb(76,217,138)",
+        "description": "Network"
+    },
+    "click-header": {
+        "type": "header",
+        "description": "Click"
+    },
+    "command": {
+        "type": "entry",
+        "default": "gnome-system-monitor -r",
+        "description": "Command to run on click",
+        "tooltip": "Leave empty to do nothing on click"
+    }
+}
