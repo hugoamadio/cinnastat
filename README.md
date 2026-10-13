@@ -28,14 +28,9 @@ Every cell is a percentage, so 100% always means "at the limit", over a graph of
 | **DISK** | read + write per second | the busiest disk never stopped working, like *active time* in the Windows Task Manager or `%util` in `iostat` |
 | **NET** | download + upload per second | the busiest connection is using all of its link speed: the negotiated speed for a cable, the current bitrate for Wi-Fi |
 
-Hover for the details:
+Hover for every CPU core with its own graph, and the details behind the other three:
 
-```
-CPU 18% (average of 8 threads) · busiest thread 64% · load 0.73 0.96 1.62
-Memory 57% · 17.4 GB of 31.1 GB · swap 2.7 GB
-Disk 54% busy · read 1.2 MB/s · write 225 MB/s · / 48% full, 150 GB free
-Network 0% of link · ↓ 5.7 KB/s · ↑ 8.4 KB/s · cable 1 Gbit/s, Wi-Fi 58.5 Mbit/s
-```
+<img src="docs/popup.png" alt="cinnastat hover popup: 8 CPU cores each with a small graph and percentage, then memory 18.1 GB of 31.1 GB, disk read/write and free space, network down/up and link speeds" width="600">
 
 Wi-Fi speed comes from NetworkManager, which every Mint install has. Without it, NET shows the traffic
 itself, over a graph that scales to the busiest moment on screen.
@@ -93,8 +88,10 @@ dbus-send --session --dest=org.Cinnamon.LookingGlass --type=method_call /org/Cin
   org.Cinnamon.LookingGlass.ReloadExtension string:cinnastat@hugoamadio string:APPLET
 ```
 
-The parsers in [`stats.js`](files/cinnastat@hugoamadio/stats.js) are plain JavaScript with no Cinnamon
-imports, so the tests run under Node. Errors from the applet show up in `~/.xsession-errors` and in Looking
+[`stats.js`](files/cinnastat@hugoamadio/stats.js) reads and formats the numbers. It is plain JavaScript
+with no Cinnamon imports, so the tests run under Node. [`applet.js`](files/cinnastat@hugoamadio/applet.js)
+draws the panel display, [`popup.js`](files/cinnastat@hugoamadio/popup.js) the hover popup and
+[`graph.js`](files/cinnastat@hugoamadio/graph.js) the graph cells both share. Errors from the applet show up in `~/.xsession-errors` and in Looking
 Glass (`Alt+F2`, `lg`).
 
 Tested on Linux Mint 22.3 with Cinnamon 6.6. Issues and pull requests are welcome.

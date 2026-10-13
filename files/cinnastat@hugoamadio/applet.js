@@ -10,6 +10,8 @@ const St = imports.gi.St;
 const Pango = imports.gi.Pango;
 const PangoCairo = imports.gi.PangoCairo;
 const Stats = require("./stats");
+const Graph = require("./graph");
+const { Popup } = require("./popup");
 
 // cells, left to right and top to bottom. Each shows a label, an optional detail
 // and a percentage over its history graph. `widest` sizes the detail column.
@@ -20,6 +22,7 @@ const CELLS = [
     { key: "net", label: "NET", widest: "888M" },
 ];
 const HISTORY = 600;          // samples kept per cell, more than any cell is wide
+const CORE_HISTORY = 200;     // samples kept per core, for the popup
 const SPACE_EVERY = 30;       // ticks between disk space checks (tooltip only)
 const LINKS_EVERY = 10;       // ticks between link speed checks
 const NET_FLOOR = 128 * 1024; // graph scale when no link speed is known
@@ -32,7 +35,8 @@ class CinnastatApplet extends Applet.Applet {
         this.setAllowedLayout(Applet.AllowedLayout.BOTH);
 
         this._history = { cpu: [], mem: [], disk: [], net: [], netRate: [] };
-        this._now = { cpu: 0, mem: 0, disk: 0, net: null };
+        this._coreHistory = [];
+        this._now = { cpu: 0, cores: [], mem: 0, disk: 0, net: null };
         this._prev = null;
         this._mem = null;
         this._physical = new Map();
@@ -44,12 +48,13 @@ class CinnastatApplet extends Applet.Applet {
         this._area = new St.DrawingArea({ x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
         this._area.connect("repaint", (area) => this._draw(area));
         this.actor.add_child(this._area);
+        this._popup = new Popup(this, () => this._popupData());
 
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
         this.settings.bind("interval", "interval", () => this._start());
         this.settings.bind("width", "width", () => this._resize());
         this.settings.bind("command", "command");
-        for (const c of CELLS) this.settings.bind(c.key + "-color", c.key + "Color", () => this._area.queue_repaint());
+        for (const c of CELLS) this.settings.bind(c.key + "-color", c.key + "Color", () => this._redraw());
 
         this._resize();
         this._tick();
@@ -62,6 +67,7 @@ class CinnastatApplet extends Applet.Applet {
 
     on_applet_removed_from_panel() {
         this._stop();
+        this._popup.destroy();
         this.settings.finalize();
     }
 
@@ -105,11 +111,15 @@ class CinnastatApplet extends Applet.Applet {
     _tick() {
         try {
             this._sample();
-            this._area.queue_repaint();
-            this.set_applet_tooltip(this._tooltip());
+            this._redraw();
         } catch (e) {
             global.logError("cinnastat: " + e);
         }
+    }
+
+    _redraw() {
+        this._area.queue_repaint();
+        if (this._popup.visible) this._popup.update();
     }
 
     _read(path) {
@@ -153,8 +163,9 @@ class CinnastatApplet extends Applet.Applet {
         const n = this._now;
         const m = this._mem;
         n.cpu = Stats.cpuPercent(prev.cpu, cur.cpu);
-        n.busiestCore = 0;
-        cur.cores.forEach((c, i) => { n.busiestCore = Math.max(n.busiestCore, Stats.cpuPercent(prev.cores[i], c)); });
+        n.cores = cur.cores.map((c, i) => Stats.cpuPercent(prev.cores[i], c));
+        n.cores.forEach((pct, i) => Stats.push(this._coreHistory[i] || (this._coreHistory[i] = []), pct, CORE_HISTORY));
+        this._coreHistory.length = n.cores.length;
         n.mem = m.total ? (100 * m.used) / m.total : 0;
         n.disk = Stats.diskBusy(prev.disks, cur.disks, dt);
         n.read = Stats.rate(Stats.total(prev.disks, "read"), Stats.total(cur.disks, "read"), dt);
@@ -224,27 +235,31 @@ class CinnastatApplet extends Applet.Applet {
         }
     }
 
-    _tooltip() {
+    // everything the hover popup shows: [percentage, details] per row, plus the cores
+    _popupData() {
         const n = this._now;
         const m = this._mem || { total: 0, used: 0, swapUsed: 0 };
         const rate = (v) => Stats.human(v || 0) + "/s";
-        const cores = this._prev ? this._prev.cores.length : 0;
-        const space = this._space && this._space.size > 0
-            ? ` · / ${Stats.percent((100 * this._space.used) / this._space.size)} full, ` +
-              `${Stats.human(this._space.size - this._space.used)} free`
-            : "";
-        const links = [...this._links.entries()]
-            .map(([, l]) => `${l.wireless ? "Wi-Fi" : "cable"} ${Stats.bitrate(l.bps)}`)
-            .join(", ");
-        return [
-            `CPU ${Stats.percent(n.cpu)}` + (cores > 1 ? ` (average of ${cores} threads) · busiest thread ${Stats.percent(n.busiestCore)}` : "") +
-                ` · load ${Stats.parseLoad(this._read("/proc/loadavg"))}`,
-            `Memory ${Stats.percent(n.mem)} · ${Stats.human(m.used)} of ${Stats.human(m.total)}` +
-                (m.swapUsed > 0 ? ` · swap ${Stats.human(m.swapUsed)}` : ""),
-            `Disk ${Stats.percent(n.disk)} busy · read ${rate(n.read)} · write ${rate(n.write)}${space}`,
-            (n.net === null ? "Network" : `Network ${Stats.percent(n.net)} of link`) +
-                ` · ↓ ${rate(n.rx)} · ↑ ${rate(n.tx)}` + (links ? ` · ${links}` : ""),
-        ].join("\n");
+        const sp = this._space;
+        const links = [...this._links.values()]
+            .map((l) => `${l.wireless ? "Wi-Fi" : "cable"} ${Stats.bitrate(l.bps)}`)
+            .join(" · ");
+        return {
+            colors: { cpu: this.cpuColor, mem: this.memColor, disk: this.diskColor, net: this.netColor },
+            cores: n.cores,
+            coreHistory: this._coreHistory,
+            rows: {
+                cpu: [Stats.percent(n.cpu),
+                    `average of ${n.cores.length} threads · load ${Stats.parseLoad(this._read("/proc/loadavg"))}`],
+                mem: [Stats.percent(n.mem),
+                    `${Stats.human(m.used)} of ${Stats.human(m.total)}` + (m.swapUsed > 0 ? ` · swap ${Stats.human(m.swapUsed)}` : "")],
+                disk: [Stats.percent(n.disk),
+                    `read ${rate(n.read)} · write ${rate(n.write)}` +
+                    (sp && sp.size > 0 ? `\n${Stats.percent((100 * sp.used) / sp.size)} full · ${Stats.human(sp.size - sp.used)} free` : "")],
+                net: [n.net === null ? "–" : Stats.percent(n.net),
+                    `↓ ${rate(n.rx)} · ↑ ${rate(n.tx)}` + (links ? `\n${links}` : "")],
+            },
+        };
     }
 
     // [detail, value] of a cell; NET shows only its traffic when no link speed is known
@@ -266,8 +281,7 @@ class CinnastatApplet extends Applet.Applet {
         const cr = area.get_context();
         const [w, h] = area.get_surface_size();
         const node = area.get_theme_node();
-        const fg = node.get_foreground_color();
-        const ink = { r: fg.red / 255, g: fg.green / 255, b: fg.blue / 255 };
+        const ink = Graph.inkOf(area);
         const gap = Math.max(1, Math.round(2 * global.ui_scale));
         const cw = Math.floor((w - gap) / 2);
         const ch = Math.floor((h - gap) / 2);
@@ -291,32 +305,11 @@ class CinnastatApplet extends Applet.Applet {
     }
 
     _drawCell(cr, fonts, cell, x, y, w, h, ink) {
-        const r = Math.min(3 * global.ui_scale, h / 4);
-        const color = Stats.parseColor(this[cell.key + "Color"]);
-
-        roundedRect(cr, x, y, w, h, r);
-        cr.setSourceRGBA(ink.r, ink.g, ink.b, 0.1);
-        cr.fillPreserve();
-        cr.save();
-        cr.clip();
-
-        // history graph: newest sample on the right edge, one sample per pixel
         const rateOnly = cell.key === "net" && this._now.net === null;
-        const values = rateOnly ? this._history.netRate : this._history[cell.key];
-        const max = rateOnly ? Stats.scaleMax(values.slice(-w), NET_FLOOR) : 100;
-        const count = Math.min(values.length, w + 1);
-        if (count > 1) {
-            cr.moveTo(x + w, y + h);
-            for (let k = 0; k < count; k++) {
-                const v = values[values.length - 1 - k];
-                cr.lineTo(x + w - k, y + h - h * Stats.clamp(v / max, 0, 1));
-            }
-            cr.lineTo(x + w - (count - 1), y + h);
-            cr.closePath();
-            cr.setSourceRGBA(color.r, color.g, color.b, 0.55 * color.a);
-            cr.fill();
-        }
-        cr.restore();
+        Graph.paintCell(cr, x, y, w, h,
+            rateOnly ? this._history.netRate : this._history[cell.key],
+            rateOnly ? Stats.scaleMax(this._history.netRate.slice(-w), NET_FLOOR) : 100,
+            Stats.parseColor(this[cell.key + "Color"]), ink);
 
         // label on the left, value on the right, detail just before the value column.
         // Room is checked against the widest possible texts, so nothing blinks as values
@@ -353,17 +346,7 @@ class CinnastatApplet extends Applet.Applet {
             cr.moveTo(x + pad, ty);
             PangoCairo.show_layout(cr, fonts.bold);
         }
-        this._fit = Math.max(this._fit || 0, pad + lw + 2 * pad + dw + pad + valueCol + pad);
     }
-}
-
-function roundedRect(cr, x, y, w, h, r) {
-    cr.newSubPath();
-    cr.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
-    cr.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
-    cr.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
-    cr.arc(x + r, y + r, r, Math.PI, (3 * Math.PI) / 2);
-    cr.closePath();
 }
 
 function main(metadata, orientation, panelHeight, instanceId) {

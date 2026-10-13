@@ -1,0 +1,14 @@
+/* Hover popup. Background, text color and shadow come from the theme's .menu. */
+.cinnastat-popup {
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.cinnastat-name,
+.cinnastat-pct {
+    font-weight: bold;
+}
+
+.cinnastat-pct {
+    padding-left: 8px;
+}

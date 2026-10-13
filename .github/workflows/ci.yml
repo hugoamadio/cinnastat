@@ -15,7 +15,7 @@ jobs:
       - name: unit tests
         run: node --test test/*.test.js
       - name: applet parses
-        run: node --check files/cinnastat@hugoamadio/applet.js
+        run: for f in files/cinnastat@hugoamadio/*.js; do node --check "$f" || exit 1; done
       - name: json files are valid
         run: for f in info.json files/cinnastat@hugoamadio/*.json; do python3 -m json.tool "$f" > /dev/null || exit 1; done
       - name: shellcheck
